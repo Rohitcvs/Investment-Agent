@@ -1,116 +1,67 @@
 # Multi-Agent Investment Analysis
 
-A stock analysis tool that runs a few specialized LLM agents in parallel to pull together technical indicators, recent news, and a written summary with a Buy/Hold/Sell call at the end. Built on LangGraph with a Streamlit front end.
+A stock analysis tool where specialized LLM agents work together: two agents research a stock and compute technical indicators in parallel, a writer drafts a report with a Buy/Hold/Sell call, and a critic reviews it before it's saved to memory. Built with LangGraph, with a Streamlit front end.
 
 It's a learning project, not investment advice.
 
-## Project structure
+## How it works
 
-### tools.py
-
-Core tools used by the AI agents to perform various analysis tasks:
-
-**StockDataTool**
-- Purpose: Fetches historical stock data for any given ticker symbol
-- Data Source: Yahoo Finance (yfinance)
-- Time Period: 1 year of historical data
-- Output: Formatted DataFrame with OHLCV data
-
-**TechnicalIndicatorTool**
-- Purpose: Calculates various technical indicators for stock analysis
-- Indicators Included: RSI (Relative Strength Index), MACD (Moving Average Convergence Divergence), SMA (Simple Moving Average - 20 period), Bollinger Bands
-- Library: pandas-ta for technical analysis calculations
-- Output: Last 5 rows of data with calculated indicators
-
-**EconomicResearcherTool**
-- Purpose: Performs internet searches for financial news and market sentiment
-- Search Engine: DuckDuckGo (via ddgs library)
-- Focus: Recent news and analysis from the last 6-12 months
-- Output: Formatted search results with titles, snippets, and URLs
-- Sources: Prioritizes trusted financial sources over forums/blogs
-
-**FinancialReportFormatter**
-- Purpose: Formats collected data into professional financial reports
-- Format: Clean Markdown with proper escaping
-- Structure: Includes analysis summary and disclaimer
-- Output: Professional-grade financial report
-
-**FinancialReportEditor**
-- Purpose: Acts as a lead editor to refine and improve report quality
-- Role: Ensures consistency and directional clarity in analysis
-- Output: Polished financial report with editorial improvements
-
-**MemoryTool**
-- Purpose: Provides persistent storage for financial reports
-- Storage: Local JSON file (report_memory.json)
-- Operations: Save and retrieve reports by ticker symbol
-- Benefit: Enables long-term context and trend analysis
-
-### playground.py
-
-The main application file that orchestrates the multi-agent workflow using Streamlit.
-
-**Architecture**
-- Framework: LangGraph for agent workflow orchestration
-- UI: Streamlit web interface
-- AI Model: OpenAI GPT-4 for all agents
-- State Management: TypedDict for tracking workflow state
-
-**Specialized Agents**
-
-Research Agent
-- Retrieves historical reports from memory
-- Fetches current stock data
-- Searches for recent news and sentiment
-- Consolidates findings into comprehensive summary
-
-Technical Analyst
-- Calculates technical indicators
-- Provides technical analysis insights
-- Focuses purely on chart-based analysis
-
-Report Writer
-- Synthesizes research and technical data
-- Provides investment recommendations (Buy/Hold/Sell)
-- Formats analysis into professional reports
-
-Critic Agent
-- Reviews report quality and completeness
-- Ensures focus on recent data (6-12 months)
-- Validates formatting and professional standards
-- Triggers revision cycles if needed
-
-Memory Agent
-- Archives final reports for future reference
-- Maintains historical context
-
-**Workflow Process**
-1. Parallel Execution: Research and Technical Analysis run simultaneously
-2. Data Aggregation: Results are combined from both branches
-3. Report Generation: Writer creates initial draft
-4. Quality Control: Critic reviews and provides feedback
-5. Revision Loop: Up to 3 revision cycles for quality improvement
-6. Memory Storage: Final report is archived
-7. Web Display: Results presented in clean Markdown format
-
-## Setup
-
-```bash
-pip install -r requirements.txt
-export OPENAI_API_KEY="your-key-here"
+```
+START ─┬─► Research agent ──┐
+       └─► Technical agent ─┴─► Writer ─► Critic ──(approved, or 3 revisions done)──► Memory ─► END
+                                  ▲          │
+                                  └──────────┘ (needs revision)
 ```
 
-## Running it
+| Agent | Job | Tools |
+|---|---|---|
+| Research | Past reports, 1-year price summary, recent news (last 6–12 months) | Memory_Tool, Stock_Data_Fetcher, Economic_Researcher |
+| Technical Analyst | RSI, MACD, SMA-20, Bollinger Bands (20-day) | Technical_Indicator_Calculator |
+| Writer | Synthesizes both into a report with a Buy/Hold/Sell call | — |
+| Critic | Checks recency, grounding in the data, and clarity; approves or sends feedback | — |
+| Memory | Saves the final report per ticker in `report_memory.json` | MemoryTool (direct call) |
 
-```bash
+1. **Research and Technical run in parallel.** Neither depends on the other, so both start from `START`, and the writer waits for both to finish.
+2. **Each of them is a ReAct sub-agent.** The model calls a tool, sees the result, and keeps going until it can write a summary grounded in that data.
+3. **The writer and critic form a quality-control loop.** If the critic doesn't reply `APPROVED`, the writer revises its previous draft using the feedback, up to 3 revisions. After that, the latest draft is used, so the loop can't run forever.
+4. **Memory saves the final report**, and the research agent retrieves the most recent past reports on the next run for that ticker, giving it historical context.
+
+## Project structure
+
+| File | Purpose |
+|---|---|
+| `graph.py` | The LangGraph workflow: state, agents, edges |
+| `tools.py` | Data, search, formatting and memory tools |
+| `playground.py` | Streamlit UI with a live log of each agent's step |
+| `tests/test_workflow.py` | Tests of the whole workflow using scripted fake models (no API key needed) |
+
+## Design decisions
+
+- **One job per agent, with only the tools it needs.** Focused prompts are more reliable, and each agent can be debugged on its own.
+- **LLMs for judgment, plain code for guarantees.** Formatting, escaping `$` signs, and saving to memory always happen the same way, so they're code, not something a prompt asks the model to do.
+- **Agents only use facts their tools returned**, and the critic checks that claims are supported by the data.
+- **Each role can use a different model** (`build_graph(model, writer_model=..., ...)`), e.g. a cheaper one for simpler agents.
+- **The UI is separate from the workflow**, so the workflow can be tested without Streamlit or real API calls.
+
+## Setup and running
+
+```
+pip install -r requirements.txt
+# create a .env file containing: OPENAI_API_KEY=your-key-here
 streamlit run playground.py
 ```
 
-Type in a ticker (AAPL, GOOGL, TSLA, whatever), hit **Run Analysis**, and expand the agent log if you want to watch what each step is doing. The finished report shows up at the bottom.
+Type a ticker (AAPL, GOOGL, TSLA...), click **Run Analysis**, and expand the log to watch each agent's steps.
 
-## Things I want to add next
+Run the tests:
 
-- More technical indicators
-- Other data sources besides yfinance
-- A way to compare reports across runs so I can track trends over time
-- Maybe swap GPT-4 out for something cheaper on the simpler agents
+```
+pytest -v
+```
+
+## Ideas for next steps
+
+- Track how recommendations change across runs for the same ticker
+- More data sources besides yfinance
+- Tracing with LangSmith for observability
+- An evaluation set of tickers to compare report quality across prompt or model changes
