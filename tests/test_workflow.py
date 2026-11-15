@@ -1,6 +1,7 @@
 """Tests for the workflow, using scripted fake models instead of real LLM calls."""
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
@@ -137,3 +138,12 @@ def test_approved_must_be_the_verdict_not_just_a_word(tmp_path):
     )
     result = graph.invoke(initial_state("AAPL"))
     assert "Draft 2" in result["final_report"]
+
+
+def test_concurrent_memory_saves_are_not_lost(tmp_path):
+    memory = MemoryTool(file_path=str(tmp_path / "memory.json"))
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda i: memory.save("AAPL", f"report {i}"), range(50)))
+
+    saved = json.loads(Path(memory.file_path).read_text())
+    assert sorted(saved["AAPL"]) == sorted(f"report {i}" for i in range(50))

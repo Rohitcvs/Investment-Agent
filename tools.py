@@ -1,6 +1,8 @@
 import json
 import os
 import re
+import tempfile
+import threading
 from typing import Optional
 
 from langchain_core.tools import BaseTool
@@ -112,6 +114,18 @@ class FinancialReportFormatter(BaseTool):
         return f"# Financial Report\n\n## Analysis Summary\n{safe}\n\n## Disclaimer\n{DISCLAIMER}\n"
 
 
+# One lock per memory file. save() is read-modify-write, so without a lock two
+# runs saving at the same time (e.g. two Streamlit sessions, which are threads in
+# one process) could both read the old file and one report would be lost.
+_file_locks: dict[str, threading.Lock] = {}
+_file_locks_guard = threading.Lock()
+
+
+def _lock_for(path: str) -> threading.Lock:
+    with _file_locks_guard:
+        return _file_locks.setdefault(os.path.abspath(path), threading.Lock())
+
+
 class MemoryTool(BaseTool):
     """Saves and retrieves past financial reports per ticker in a JSON file."""
     name: str = "Memory_Tool"
@@ -129,10 +143,20 @@ class MemoryTool(BaseTool):
             return json.load(f)
 
     def save(self, ticker: str, report: str) -> str:
-        memory = self._load()
-        memory.setdefault(ticker.upper(), []).append(report)
-        with open(self.file_path, "w") as f:
-            json.dump(memory, f, indent=2)
+        with _lock_for(self.file_path):
+            memory = self._load()
+            memory.setdefault(ticker.upper(), []).append(report)
+            # Write to a temp file, then atomically swap it in: a crash mid-write can't
+            # leave a truncated, unreadable JSON file behind.
+            directory = os.path.dirname(os.path.abspath(self.file_path))
+            fd, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(memory, f, indent=2)
+                os.replace(tmp_path, self.file_path)
+            except BaseException:
+                os.unlink(tmp_path)
+                raise
         return f"Report for {ticker.upper()} saved successfully."
 
     def retrieve(self, ticker: str, last_n: int = 2) -> str:
