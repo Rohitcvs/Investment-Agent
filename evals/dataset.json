@@ -1,0 +1,4 @@
+{
+  "description": "Fixed set of tickers across sectors. Rerun the same set after every prompt or model change, so results are comparable.",
+  "tickers": ["AAPL", "MSFT", "NVDA", "AMZN", "JPM", "JNJ", "XOM", "KO", "TSLA", "WMT"]
+}
