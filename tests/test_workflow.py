@@ -1,126 +1,71 @@
-"""Tests for the workflow, using scripted fake models instead of real LLM calls."""
+"""The core workflow: data flow, the critic loop, memory, and parallel execution."""
 import json
-import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
-from langchain_core.tools import tool
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from graph import initial_state
+from tools import FinancialReportFormatter, MemoryTool
 
-from graph import MAX_REVISIONS, build_graph, initial_state  # noqa: E402
-from tools import FinancialReportFormatter, MemoryTool  # noqa: E402
-
-
-class FakeModel(GenericFakeChatModel):
-    """Returns pre-scripted messages in order, and records every prompt it receives."""
-
-    def __init__(self, replies, **kwargs):
-        super().__init__(messages=iter(replies), **kwargs)
-        object.__setattr__(self, "prompts", [])
-
-    def bind_tools(self, tools, **kwargs):
-        return self
-
-    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
-        self.prompts.append("\n".join(str(m.content) for m in messages))
-        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+CONFIG = {"configurable": {"thread_id": "test"}}
 
 
-@tool
-def fake_indicators(ticker: str) -> str:
-    """Fake technical indicator tool."""
-    return f"{ticker}: RSI_14=61.2 MACD=1.4"
+def test_agents_see_tool_results_and_writer_gets_real_data(make_graph):
+    graph, models, _, _ = make_graph(["APPROVED"], ["Draft 1: Hold AAPL."])
+    result = graph.invoke(initial_state("aapl"), CONFIG)
 
-
-def call(name, args, call_id):
-    return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": call_id}])
-
-
-def make_graph(tmp_path, critic_replies, writer_replies):
-    memory = MemoryTool(file_path=str(tmp_path / "memory.json"))
-    models = {
-        "research": FakeModel([
-            call("Memory_Tool", {"action": "retrieve", "ticker": "AAPL"}, "r1"),
-            AIMessage(content="Research summary: no past reports; strong iPhone sales news."),
-        ]),
-        "technical": FakeModel([
-            call("fake_indicators", {"ticker": "AAPL"}, "t1"),
-            AIMessage(content="Technical summary: RSI 61 shows moderate momentum."),
-        ]),
-        "writer": FakeModel(writer_replies),
-        "critic": FakeModel(critic_replies),
-    }
-    graph = build_graph(
-        models["writer"],
-        research_model=models["research"],
-        technical_model=models["technical"],
-        writer_model=models["writer"],
-        critic_model=models["critic"],
-        research_tools=[memory],
-        technical_tools=[fake_indicators],
-        memory=memory,
-    )
-    return graph, models, memory
-
-
-def test_agents_see_tool_results_and_writer_gets_real_data(tmp_path):
-    graph, models, _ = make_graph(tmp_path, ["APPROVED"], ["Draft 1: Hold AAPL."])
-    result = graph.invoke(initial_state("aapl"))
-
-    # Fix 3: the technical agent's second call included its tool's output (the ReAct loop).
-    assert "RSI_14=61.2" in models["technical"].prompts[1]
-    # Fix 1: the writer received the agents' actual summaries, not tool-call requests.
+    assert "RSI_14=61.2" in models["technical"].prompts[1]   # the agent read its tool's output
     writer_prompt = models["writer"].prompts[0]
-    assert "strong iPhone sales news" in writer_prompt
-    assert "RSI 61 shows moderate momentum" in writer_prompt
-    assert "tool_calls" not in writer_prompt
+    assert "strong iPhone sales news" in writer_prompt         # writer got real summaries,
+    assert "RSI 61.2 shows moderate momentum" in writer_prompt
+    assert "tool_calls" not in writer_prompt                   # not tool-call requests
     assert "Draft 1: Hold AAPL." in result["final_report"]
 
 
-def test_final_report_is_saved_to_memory(tmp_path):
-    graph, _, memory = make_graph(tmp_path, ["APPROVED"], ["Draft 1: Buy."])
-    graph.invoke(initial_state("AAPL"))
+def test_final_report_is_saved_to_memory(make_graph):
+    graph, _, memory, _ = make_graph(["APPROVED"], ["Draft 1: Buy."])
+    result = graph.invoke(initial_state("AAPL"), CONFIG)
 
-    # Fix 2: the memory step actually writes the file.
     saved = json.loads(Path(memory.file_path).read_text())
-    assert len(saved["AAPL"]) == 1
     assert "Draft 1: Buy." in saved["AAPL"][0]
-    assert "Draft 1: Buy." in memory.retrieve("AAPL")
+    assert result["status"] == "saved"
 
 
-def test_critic_feedback_reaches_writer_with_previous_draft(tmp_path):
-    graph, models, _ = make_graph(
-        tmp_path,
-        ["Mention the RSI value explicitly.", "APPROVED"],
-        ["Draft 1: Hold.", "Draft 2: Hold, RSI is 61."],
-    )
-    result = graph.invoke(initial_state("AAPL"))
+def test_critic_feedback_reaches_writer_with_previous_draft(make_graph):
+    graph, models, _, _ = make_graph(["Mention the RSI value.", "APPROVED"],
+                                     ["Draft 1: Hold.", "Draft 2: Hold, RSI is 61."])
+    result = graph.invoke(initial_state("AAPL"), CONFIG)
 
     revision_prompt = models["writer"].prompts[1]
-    assert "Mention the RSI value explicitly." in revision_prompt
-    assert "Draft 1: Hold." in revision_prompt          # revises instead of starting over
+    assert "Mention the RSI value." in revision_prompt
+    assert "Draft 1: Hold." in revision_prompt                 # revises instead of starting over
     assert "Draft 2" in result["final_report"]
     assert result["revision_number"] == 1
 
 
-def test_revision_loop_stops_after_max_revisions(tmp_path):
-    drafts = [f"Draft {i}" for i in range(1, MAX_REVISIONS + 2)]
-    graph, models, _ = make_graph(tmp_path, ["Needs work."] * (MAX_REVISIONS + 1), drafts)
-    result = graph.invoke(initial_state("AAPL"))
+def test_revision_loop_stops_after_max_revisions(make_graph):
+    graph, models, _, _ = make_graph(["Needs work."] * 4, [f"Draft {i}" for i in range(1, 5)])
+    result = graph.invoke(initial_state("AAPL"), CONFIG)
 
-    assert len(models["writer"].prompts) == MAX_REVISIONS + 1  # first draft + 3 revisions
-    assert f"Draft {MAX_REVISIONS + 1}" in result["final_report"]
+    assert len(models["writer"].prompts) == 4                  # first draft + 3 revisions
+    assert "Draft 4" in result["final_report"]
     assert any("revision limit" in line for line in result["log"])
 
 
-def test_research_and_technical_run_in_parallel_before_writer(tmp_path):
-    graph, _, _ = make_graph(tmp_path, ["APPROVED"], ["Draft 1"])
-    steps = [list(update)[0] for update in graph.stream(initial_state("AAPL"), stream_mode="updates")]
+def test_research_and_technical_run_in_parallel_before_writer(make_graph):
+    graph, _, _, _ = make_graph(["APPROVED"], ["Draft 1"])
+    steps = [list(u)[0] for u in graph.stream(initial_state("AAPL"), CONFIG, stream_mode="updates")]
 
-    assert set(steps[:2]) == {"research", "technical"}
-    assert steps[2:] == ["writer", "critic", "memory"]
+    assert steps[0] == "validate"
+    assert set(steps[1:3]) == {"research", "technical"}
+    assert steps[3:] == ["writer", "critic", "approval", "memory"]
+
+
+def test_approved_must_be_the_verdict_not_just_a_word(make_graph):
+    graph, _, _, _ = make_graph(["This is not approved yet: add dates.", "APPROVED"], ["Draft 1", "Draft 2"])
+    result = graph.invoke(initial_state("AAPL"), CONFIG)
+    assert "Draft 2" in result["final_report"]
 
 
 def test_formatter_escapes_dollar_signs_once():
@@ -129,11 +74,10 @@ def test_formatter_escapes_dollar_signs_once():
     assert "not financial advice" in report
 
 
-def test_approved_must_be_the_verdict_not_just_a_word(tmp_path):
-    graph, _, _ = make_graph(
-        tmp_path,
-        ["This is not approved yet: add news dates.", "APPROVED"],
-        ["Draft 1", "Draft 2"],
-    )
-    result = graph.invoke(initial_state("AAPL"))
-    assert "Draft 2" in result["final_report"]
+def test_concurrent_memory_saves_are_not_lost(tmp_path):
+    memory = MemoryTool(file_path=str(tmp_path / "memory.json"))
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda i: memory.save("AAPL", f"report {i}"), range(50)))
+
+    saved = json.loads(Path(memory.file_path).read_text())
+    assert sorted(saved["AAPL"]) == sorted(f"report {i}" for i in range(50))

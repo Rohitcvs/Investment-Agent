@@ -1,0 +1,7 @@
+.env
+.git
+__pycache__
+.pytest_cache
+report_memory.json
+audit_log.jsonl
+evals/results
