@@ -16,6 +16,9 @@ Layers covered:
 - Audit: every decision (input rejected, critic verdict, approval, save) is logged.
 - Production: price data is retried and cached (see tools.py).
 - Optimization: the critic can use a cheaper model than the writer.
+- Skills: every prompt comes from a versioned skill (skills.py), and each run
+  records which versions it used.
+- Customer context: loaded once in `validate`, then read by the writer and critic.
 """
 import operator
 from typing import Annotated, Optional, TypedDict
@@ -29,9 +32,11 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
 from audit import AuditLog
+from context import CustomerContextStore, context_as_prompt
 from guardrails import validate_ticker
 from observability import log_event, traced_node
 from settings import settings
+from skills import get_skill
 from tools import (
     EconomicResearcherTool,
     FinancialReportFormatter,
@@ -40,39 +45,11 @@ from tools import (
     TechnicalIndicatorTool,
 )
 
-RESEARCH_PROMPT = (
-    "You are a research assistant gathering data on a stock. Use your tools to: "
-    "1. Retrieve past reports from memory for long-term context (Memory_Tool, action='retrieve'). "
-    "2. Fetch the last year of stock data. "
-    "3. Research recent news and market sentiment, focusing strictly on sources from the last 6-12 months. "
-    "Then write a consolidated summary of what you found. Only use facts your tools returned."
-)
-
-TECHNICAL_PROMPT = (
-    "You are a technical analyst. Use your tool to calculate technical indicators for the stock, "
-    "then explain what RSI, MACD, SMA-20 and the Bollinger Bands say about its recent trend and momentum. "
-    "Only use the numbers your tool returned."
-)
-
-WRITER_PROMPT = (
-    "You are a senior financial analyst. Write a clear analysis using ONLY the research and technical "
-    "data provided, with a strong emphasis on the last 6-12 months. Synthesize both into a coherent "
-    "narrative, highlight recent trends and news, and end with a recommendation: Buy, Hold, or Sell, "
-    "with the reasons. Write in clean Markdown."
-)
-
-CRITIC_PROMPT = (
-    "You are a meticulous financial editor reviewing a draft report. Check: "
-    "1. Recency: does it focus on data and events from the last 6-12 months? "
-    "2. Grounding: is every claim supported by the research and technical data? "
-    "3. Clarity: is the reasoning clear, with a definite Buy/Hold/Sell recommendation? "
-    "If the report needs no changes, reply with only the word APPROVED. "
-    "Otherwise, give specific, actionable feedback for the writer."
-)
-
-
 class AgentState(TypedDict):
     ticker: str
+    customer_id: str
+    customer_context: Optional[dict]  # loaded once at the start; every later node reads it
+    skills: Optional[dict]            # skill versions used, e.g. {"writer": "1.1.0"}
     status: str                       # running, rejected_input, approved, rejected, saved
     error: Optional[str]
     research_data: Optional[str]
@@ -110,13 +87,21 @@ def build_graph(
     require_approval: bool | None = None,
     max_revisions: int | None = None,
     checkpointer=None,
+    context_store: CustomerContextStore | None = None,
+    skill_versions: dict | None = None,
 ):
     """Build the workflow. Every dependency can be swapped, which is how the tests run without real APIs."""
     memory = memory or MemoryTool(file_path=settings.memory_file)
     audit = audit or AuditLog(settings.audit_file)
+    context_store = context_store or CustomerContextStore()
     require_approval = settings.require_approval if require_approval is None else require_approval
     max_revisions = settings.max_revisions if max_revisions is None else max_revisions
     formatter = FinancialReportFormatter()
+
+    # Prompts come from the versioned skill registry, not hard-coded strings.
+    skills = {name: get_skill(name, pins=skill_versions)
+              for name in ("research", "technical", "writer", "critic")}
+    skill_record = {name: skill.version for name, skill in skills.items()}
 
     research_llm = research_model or model
     technical_llm = technical_model or model
@@ -127,12 +112,12 @@ def build_graph(
     research_agent = create_agent(
         research_llm,
         research_tools if research_tools is not None else [StockDataTool(), EconomicResearcherTool(), memory],
-        system_prompt=RESEARCH_PROMPT,
+        system_prompt=skills["research"].prompt,
     )
     technical_agent = create_agent(
         technical_llm,
         technical_tools if technical_tools is not None else [TechnicalIndicatorTool()],
-        system_prompt=TECHNICAL_PROMPT,
+        system_prompt=skills["technical"].prompt,
     )
 
     def run_sub_agent(agent, request: str, label: str) -> dict:
@@ -152,12 +137,18 @@ def build_graph(
 
     @traced_node("validate")
     def validate_node(state: AgentState) -> dict:
-        audit.record("run_started", ticker=state["ticker"], require_approval=require_approval)
+        customer_id = state.get("customer_id", "default")
+        audit.record("run_started", ticker=state["ticker"], customer_id=customer_id,
+                     require_approval=require_approval, skills=skill_record)
         ok, result = validate_ticker(state["ticker"])
         if not ok:
             audit.record("input_rejected", ticker=state["ticker"], reason=result)
-            return {"status": "rejected_input", "error": result, "log": [f"validate: rejected ({result})"]}
-        return {"ticker": result, "status": "running", "log": ["validate: ok"]}
+            return {"status": "rejected_input", "error": result, "skills": skill_record,
+                    "log": [f"validate: rejected ({result})"]}
+        # Load the customer's context once, so every later agent works from the same facts.
+        return {"ticker": result, "status": "running", "skills": skill_record,
+                "customer_context": context_store.get(customer_id),
+                "log": ["validate: ok"]}
 
     @traced_node("research", model_name(research_llm))
     def research_node(state: AgentState) -> dict:
@@ -175,6 +166,7 @@ def build_graph(
     def writer_node(state: AgentState) -> dict:
         prompt = (
             f"Stock: {state['ticker']}\n\n"
+            f"{context_as_prompt(state.get('customer_context'))}"
             f"## Research data and news\n{state['research_data']}\n\n"
             f"## Technical analysis\n{state['technical_analysis']}\n"
         )
@@ -185,7 +177,7 @@ def build_graph(
                 f"## Editor feedback (revision {state['revision_number']} of {max_revisions})\n"
                 f"{state['criticism']}\n\nRevise the draft to address every point."
             )
-        response = writer_llm.invoke([SystemMessage(WRITER_PROMPT), HumanMessage(prompt)])
+        response = writer_llm.invoke([SystemMessage(skills["writer"].prompt), HumanMessage(prompt)])
         report = formatter.invoke({"data": text_of(response)})
         return {"draft_report": report, "log": [f"writer: draft {state['revision_number'] + 1}"],
                 "_messages": [response]}
@@ -193,11 +185,12 @@ def build_graph(
     @traced_node("critic", model_name(critic_llm))
     def critic_node(state: AgentState) -> dict:
         prompt = (
+            f"{context_as_prompt(state.get('customer_context'))}"
             f"## Research data\n{state['research_data']}\n\n"
             f"## Technical analysis\n{state['technical_analysis']}\n\n"
             f"## Draft report\n{state['draft_report']}"
         )
-        response = critic_llm.invoke([SystemMessage(CRITIC_PROMPT), HumanMessage(prompt)])
+        response = critic_llm.invoke([SystemMessage(skills["critic"].prompt), HumanMessage(prompt)])
         verdict = text_of(response).strip()
 
         if verdict.upper().startswith("APPROVED"):
@@ -276,15 +269,19 @@ def build_graph(
 
     # A checkpointer saves the graph's state after every step. It's what lets a run pause for
     # approval and resume later, and lets us look up any run's status by its ID.
-    # MemorySaver keeps it in memory; production would use a database-backed checkpointer.
+    # MemorySaver keeps it in memory (fine for tests); the API and UI pass a SQLite-backed
+    # checkpointer (store.sqlite_checkpointer) so paused runs survive a restart.
     if checkpointer is None:
         checkpointer = MemorySaver()
     return workflow.compile(checkpointer=checkpointer)
 
 
-def initial_state(ticker: str) -> AgentState:
+def initial_state(ticker: str, customer_id: str = "default") -> AgentState:
     return {
         "ticker": (ticker or "").strip().upper(),
+        "customer_id": customer_id,
+        "customer_context": None,
+        "skills": None,
         "status": "running",
         "error": None,
         "research_data": None,

@@ -13,9 +13,11 @@ import streamlit as st
 from langchain_openai import ChatOpenAI
 
 from audit import AuditLog
+from context import CustomerContextStore
 from graph import build_graph
 from service import AnalysisService
 from settings import settings
+from store import RunStore, sqlite_checkpointer
 
 if not os.environ.get("OPENAI_API_KEY"):
     st.error("OPENAI_API_KEY environment variable not set! Add it to a .env file.")
@@ -30,8 +32,10 @@ def get_service() -> AnalysisService:
         ChatOpenAI(model=settings.main_model, temperature=0),
         critic_model=ChatOpenAI(model=settings.critic_model, temperature=0),
         audit=AuditLog(settings.audit_file),
+        context_store=CustomerContextStore(settings.database_file),
+        checkpointer=sqlite_checkpointer(settings.database_file),
     )
-    return AnalysisService(graph)
+    return AnalysisService(graph, runs=RunStore(settings.database_file))
 
 
 def show_metrics(run: dict) -> None:

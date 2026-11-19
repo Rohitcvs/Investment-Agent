@@ -34,6 +34,7 @@ def main():
     parser.add_argument("--tickers", nargs="*", help="Override the dataset tickers")
     parser.add_argument("--judge", action="store_true", help="Score grounding with an LLM judge")
     parser.add_argument("--baseline", help="A previous results file to compare against")
+    parser.add_argument("--gate", action="store_true", help="Fail (exit 1) if results miss the release thresholds")
     args = parser.parse_args()
 
     from langchain_openai import ChatOpenAI
@@ -75,6 +76,10 @@ def main():
             print("\nCompared with baseline:")
             print("\n".join(compare(summary, json.load(f)["summary"])))
     print(f"\nSaved to {path}")
+
+    if args.gate:
+        from evals.gate import main as gate_main
+        raise SystemExit(gate_main([path]))
 
 
 if __name__ == "__main__":
