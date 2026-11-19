@@ -16,6 +16,12 @@ def _bool(name: str, default: bool) -> bool:
     return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes"}
 
 
+def _pins(name: str) -> dict:
+    """Parse "writer=1.0.0,critic=1.0.0" into {"writer": "1.0.0", "critic": "1.0.0"}."""
+    raw = os.getenv(name, "").strip()
+    return dict(item.split("=", 1) for item in raw.split(",") if "=" in item) if raw else {}
+
+
 @dataclass(frozen=True)
 class Settings:
     # Optimization: each role can use a different model. The critic only has to
@@ -35,6 +41,15 @@ class Settings:
     # Files
     memory_file: str = os.getenv("MEMORY_FILE", "report_memory.json")
     audit_file: str = os.getenv("AUDIT_FILE", "audit_log.jsonl")
+
+    # Persistence: checkpoints, run records and customer context survive restarts
+    database_file: str = os.getenv("DATABASE_FILE", "agent.db")
+
+    # Async processing: how many analyses can run in the background at once
+    worker_threads: int = int(os.getenv("WORKER_THREADS", "2"))
+
+    # Skill versions: pin a version to roll back a bad release, e.g. "writer=1.0.0"
+    skill_versions: dict = field(default_factory=lambda: _pins("SKILL_VERSIONS"))
 
     # Cost estimates in USD per 1M tokens (input, output).
     # These are placeholders: check your provider's current pricing and update them.

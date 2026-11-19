@@ -1,0 +1,8 @@
+{
+  "min_completion_rate": 0.9,
+  "min_recommendation_rate": 0.9,
+  "min_disclaimer_rate": 1.0,
+  "min_avg_grounding_ratio": 0.8,
+  "max_avg_cost_usd": 0.05,
+  "max_avg_duration_ms": 120000
+}

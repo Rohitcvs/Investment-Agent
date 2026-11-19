@@ -48,7 +48,7 @@ def usage(i, o):
 def make_graph(tmp_path):
     """Build the real graph with scripted models. Returns (graph, models, memory, audit)."""
 
-    def _make(critic_replies, writer_replies, require_approval=False, research_replies=None):
+    def _make(critic_replies, writer_replies, require_approval=False, research_replies=None, **graph_options):
         memory = MemoryTool(file_path=str(tmp_path / "memory.json"))
         audit = AuditLog(str(tmp_path / "audit.jsonl"))
         models = {
@@ -77,6 +77,7 @@ def make_graph(tmp_path):
             audit=audit,
             require_approval=require_approval,
             max_revisions=3,
+            **graph_options,
         )
         return graph, models, memory, audit
 
