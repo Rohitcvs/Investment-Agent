@@ -3,7 +3,6 @@ import json
 from pathlib import Path
 
 import pytest
-from langchain_core.messages import AIMessage
 
 from graph import initial_state
 from guardrails import validate_ticker

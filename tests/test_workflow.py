@@ -3,7 +3,6 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from langchain_core.messages import AIMessage
 
 from graph import initial_state
 from tools import FinancialReportFormatter, MemoryTool

@@ -1,5 +1,9 @@
 # Multi-Agent Investment Analysis
 
+[![CI](https://github.com/Rohitcvs/Investment-Agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Rohitcvs/Investment-Agent/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.12-blue)
+![LangGraph](https://img.shields.io/badge/built%20with-LangGraph-1C3C3C)
+
 A stock analysis system where specialized AI agents research a company, analyze its price trends, write a Buy/Hold/Sell report, review each other's work, and wait for a person's approval before anything is saved. Built with LangGraph.
 
 It started as a prototype. This version hardens it into something closer to a production agent system: guardrails, human approval, an audit trail, observability, evaluations, retries and caching, a secured REST API, and CI. The full system design (architecture, data model, failure modes, scaling path) is in [docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md).
@@ -24,7 +28,7 @@ graph LR
     T --> W
     W --> C[critic]
     C -->|revise, max 3| W
-    C -->|approved| A{human approval}
+    C -->|approved and output check passes| A{human approval}
     A -->|approve| M[save to memory]
     A -->|reject| E
     M --> E
