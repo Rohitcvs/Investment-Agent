@@ -10,7 +10,7 @@ Multi-agent investment analysis workflow, built with LangGraph.
 
 Layers covered:
 - Guardrails: input validation, a step limit on each sub-agent, the critic with
-  a revision cap, and human approval before anything is saved.
+  a revision cap, a code-based output check, and human approval before anything is saved.
 - Observability: every node is timed and logged with the run's trace ID, and its
   token usage is recorded for cost estimates.
 - Audit: every decision (input rejected, critic verdict, approval, save) is logged.
@@ -33,7 +33,7 @@ from langgraph.types import interrupt
 
 from audit import AuditLog
 from context import CustomerContextStore, context_as_prompt
-from guardrails import validate_ticker
+from guardrails import check_report, validate_ticker
 from observability import log_event, traced_node
 from settings import settings
 from skills import get_skill
@@ -59,6 +59,7 @@ class AgentState(TypedDict):
     final_report: Optional[str]
     revision_number: int
     approval: Optional[dict]          # {"approved": bool, "by": ..., "reason": ...}
+    warnings: list[str]               # output-check problems still open when the revision cap was hit
     log: Annotated[list[str], operator.add]      # short human-readable trace
     usage: Annotated[list[dict], operator.add]   # per-node timing and token usage
 
@@ -111,7 +112,8 @@ def build_graph(
 
     research_agent = create_agent(
         research_llm,
-        research_tools if research_tools is not None else [StockDataTool(), EconomicResearcherTool(), memory],
+        research_tools if research_tools is not None else [StockDataTool(), EconomicResearcherTool(),
+                                                             memory.read_only_view()],  # can read, never save
         system_prompt=skills["research"].prompt,
     )
     technical_agent = create_agent(
@@ -192,21 +194,29 @@ def build_graph(
         )
         response = critic_llm.invoke([SystemMessage(skills["critic"].prompt), HumanMessage(prompt)])
         verdict = text_of(response).strip()
+        critic_approved = verdict.upper().startswith("APPROVED")
+        # Output guardrail: code checks the draft too, so an LLM's "APPROVED" can't skip it.
+        issues = check_report(state["draft_report"])
+        if issues:
+            audit.record("output_check_failed", ticker=state["ticker"], issues=issues,
+                         revisions=state["revision_number"])
 
-        if verdict.upper().startswith("APPROVED"):
+        if critic_approved and not issues:
             audit.record("critic_decision", ticker=state["ticker"], decision="approved",
                          revisions=state["revision_number"])
-            return {"final_report": state["draft_report"], "criticism": None,
+            return {"final_report": state["draft_report"], "criticism": None, "warnings": [],
                     "log": ["critic: approved"], "_messages": [response]}
         if state["revision_number"] >= max_revisions:
             audit.record("critic_decision", ticker=state["ticker"], decision="revision_limit_reached",
-                         revisions=state["revision_number"])
-            return {"final_report": state["draft_report"], "criticism": None,
+                         revisions=state["revision_number"], open_issues=issues)
+            # Hand the latest draft to the reviewer, with any open problems shown as warnings.
+            return {"final_report": state["draft_report"], "criticism": None, "warnings": issues,
                     "log": [f"critic: revision limit ({max_revisions}) reached, using latest draft"],
                     "_messages": [response]}
+        feedback = "\n".join(([] if critic_approved else [verdict]) + [f"Required fix: {i}" for i in issues])
         audit.record("critic_decision", ticker=state["ticker"], decision="revise",
-                     revisions=state["revision_number"], feedback=verdict[:500])
-        return {"criticism": verdict, "revision_number": state["revision_number"] + 1,
+                     revisions=state["revision_number"], feedback=feedback[:500])
+        return {"criticism": feedback, "revision_number": state["revision_number"] + 1,
                 "log": ["critic: revision requested"], "_messages": [response]}
 
     @traced_node("approval")
@@ -219,6 +229,7 @@ def build_graph(
             answer = interrupt({
                 "ticker": state["ticker"],
                 "report": state["final_report"],
+                "warnings": state.get("warnings", []),
                 "question": "Approve this report before it's saved and published?",
             })
             decision = {"approved": bool(answer.get("approved")),
@@ -291,6 +302,7 @@ def initial_state(ticker: str, customer_id: str = "default") -> AgentState:
         "final_report": None,
         "revision_number": 0,
         "approval": None,
+        "warnings": [],
         "log": [],
         "usage": [],
     }

@@ -11,7 +11,7 @@ from langchain_core.messages import AIMessage
 
 
 def test_each_step_records_timing_and_tokens(make_graph):
-    writer = [AIMessage(content="Draft 1", usage_metadata=usage(500, 300))]
+    writer = [AIMessage(content="Draft 1: Buy.", usage_metadata=usage(500, 300))]
     critic = [AIMessage(content="APPROVED", usage_metadata=usage(600, 2))]
     graph, _, _, _ = make_graph(critic, writer)
     run = AnalysisService(graph).start("AAPL")

@@ -38,11 +38,14 @@ class AnalysisService:
     def _config(self, run_id: str) -> dict:
         return {"configurable": {"thread_id": run_id}}
 
-    def _new_run(self, ticker: str, customer_id: str) -> str:
-        run_id = uuid.uuid4().hex[:10]
-        self.runs.create(run_id, ticker=(ticker or "").strip().upper(), customer_id=customer_id,
-                         trace_id=uuid.uuid4().hex[:12])
-        return run_id
+    def _new_run(self, ticker: str, customer_id: str, idempotency_key: str | None = None) -> tuple[str, bool]:
+        """Create a run record. Returns (run_id, created); created is False for a repeated idempotency key."""
+        new_id = uuid.uuid4().hex[:10]
+        run_id = self.runs.create(new_id, ticker=(ticker or "").strip().upper(), customer_id=customer_id,
+                                  trace_id=uuid.uuid4().hex[:12], idempotency_key=idempotency_key)
+        if run_id != new_id:
+            log_event("idempotent_replay", run_id=run_id, customer_id=customer_id)
+        return run_id, run_id == new_id
 
     def _execute(self, run_id: str, payload) -> None:
         """Run (or resume) the graph, then record the outcome. Failures are recorded, never lost."""
@@ -63,19 +66,28 @@ class AnalysisService:
 
     # --- Starting runs -------------------------------------------------------
 
-    def start(self, ticker: str, customer_id: str = "default") -> dict:
+    def start(self, ticker: str, customer_id: str = "default", idempotency_key: str | None = None) -> dict:
         """Run synchronously and return the result."""
-        run_id = self._new_run(ticker, customer_id)
-        new_trace_id()
-        self._execute(run_id, initial_state(ticker, customer_id))
+        run_id, created = self._new_run(ticker, customer_id, idempotency_key)
+        if created:  # a repeated key returns the original run instead of paying for a second one
+            new_trace_id()
+            self._execute(run_id, initial_state(ticker, customer_id))
         return self.get(run_id)
 
-    def submit(self, ticker: str, customer_id: str = "default") -> dict:
+    def submit(self, ticker: str, customer_id: str = "default", idempotency_key: str | None = None) -> dict:
         """Queue the run on a background worker and return its ID right away."""
-        run_id = self._new_run(ticker, customer_id)
-        log_event("run_queued", run_id=run_id, ticker=ticker)
-        self._executor.submit(self._execute, run_id, initial_state(ticker, customer_id))
+        run_id, created = self._new_run(ticker, customer_id, idempotency_key)
+        if created:
+            log_event("run_queued", run_id=run_id, ticker=ticker)
+            self._executor.submit(self._execute, run_id, initial_state(ticker, customer_id))
         return self.get(run_id)
+
+    def owner(self, run_id: str) -> str | None:
+        """The customer a run belongs to (used by the API to keep customers' runs apart)."""
+        record = self.runs.get(run_id)
+        if record is None:
+            raise KeyError(run_id)
+        return record["customer_id"]
 
     def decide(self, run_id: str, approved: bool, reason: str | None = None, by: str = "reviewer") -> dict:
         if self.get(run_id)["status"] != "awaiting_approval":
@@ -125,6 +137,7 @@ class AnalysisService:
             "technical_analysis": state.get("technical_analysis"),
             "revisions": state.get("revision_number", 0),
             "approval": state.get("approval"),
+            "warnings": state.get("warnings", []),
             "skills": state.get("skills"),
             "log": state.get("log", []),
             "metrics": {
