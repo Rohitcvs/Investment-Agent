@@ -2,7 +2,7 @@
 
 A stock analysis system where specialized AI agents research a company, analyze its price trends, write a Buy/Hold/Sell report, review each other's work, and wait for a person's approval before anything is saved. Built with LangGraph.
 
-It started as a prototype. This version hardens it into something closer to a production agent system: guardrails, human approval, an audit trail, observability, evaluations, retries and caching, a REST API, and CI.
+It started as a prototype. This version hardens it into something closer to a production agent system: guardrails, human approval, an audit trail, observability, evaluations, retries and caching, a secured REST API, and CI. The full system design (architecture, data model, failure modes, scaling path) is in [docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md).
 
 > A learning project. Reports are not investment advice.
 
@@ -46,26 +46,28 @@ Research and technical analysis run **in parallel**, since neither depends on th
 
 | Layer | What's implemented | Where |
 |---|---|---|
-| **Guardrails** | Input validation; a step limit on each sub-agent's tool loop; critic with revision cap; human approval before saving | `guardrails.py`, `graph.py` |
+| **Guardrails** | Input validation; a step limit on each sub-agent's tool loop; critic with revision cap; a code-based output check the critic can't skip; web results wrapped as untrusted data with injection phrases removed; read-only tools for agents; human approval before saving | `guardrails.py`, `graph.py`, `tools.py` |
 | **Audit** | Every decision (input rejected, critic verdict, approval, save) logged with its trace ID | `audit.py`, `GET /audit` |
 | **Observability** | JSON logs with a trace ID per run; per-step timing and token usage; optional LangSmith tracing | `observability.py` |
 | **Evaluation** | Fixed ticker dataset; scorers for recommendation, disclaimer, and grounding (do the report's numbers appear in the source data?); optional LLM judge; comparison against a baseline run | `evals/` |
 | **Resilience** | Retries with exponential backoff on data downloads; time-based cache | `resilience.py`, `tools.py` |
 | **Optimization** | Price history fetched once and shared by both agents; cheaper model for the critic; cost estimate per run | `tools.py`, `settings.py`, `service.py` |
 | **Serving** | REST API with an approval workflow; Streamlit UI with Approve/Reject | `api.py`, `playground.py` |
+| **Security** | API keys mapped to customers, so each customer only sees its own runs and context; admin-only audit and metrics; per-customer rate limit (token bucket); `Idempotency-Key` so a retried request never starts a second paid run | `security.py`, `api.py`, `store.py` |
 | **Versioned skills** | Every prompt is a registered, versioned skill (e.g. `writer@1.1.0`); runs record the versions they used; pin an old version to roll back without a code change | `skills.py`, `GET /skills` |
 | **Customer context** | Validated per-customer profile (risk tolerance, time horizon, notes), loaded once per run and read by the writer and critic | `context.py`, `/customers/{id}/context` |
 | **Persistence** | SQLite checkpointer, so a run paused for approval survives a restart; a run store records every run's status, trace ID, cost and latency | `store.py` |
 | **Async processing** | `?async_mode=true` returns `202` right away and runs the analysis on a worker thread; crashed runs are recorded as `failed`, never lost | `service.py` |
 | **Deployment gate and hypercare** | A release only ships if eval results meet the thresholds; after release, `/metrics` tracks failure rate, approval rate, latency and cost | `evals/gate.py`, `evals/thresholds.json`, `GET /metrics` |
-| **Delivery** | 43 tests with scripted fake models (no API keys needed); CI runs them on every PR; Dockerfile | `tests/`, `.github/workflows/ci.yml` |
+| **Delivery** | 59 tests with scripted fake models (no API keys needed); CI runs them on every PR; Dockerfile | `tests/`, `.github/workflows/ci.yml` |
 
 ## Project structure
 
 ```
 graph.py          LangGraph workflow: state, nodes, routing
 tools.py          Data, indicator, search, formatting and memory tools
-guardrails.py     Input validation
+guardrails.py     Input, untrusted-content and output checks
+security.py       API-key auth, tenant isolation, rate limiting
 service.py        Start (sync or async), pause, resume and inspect runs
 skills.py         Versioned skill registry (every prompt lives here)
 context.py        Per-customer context store
@@ -78,6 +80,7 @@ resilience.py     Retries and caching
 settings.py       All configuration, from environment variables
 evals/            Dataset, scorers, evaluation runner and deployment gate
 tests/            Unit and integration tests
+docs/             System design
 ```
 
 ## Running it
@@ -86,7 +89,7 @@ tests/            Unit and integration tests
 pip install -r requirements.txt
 cp .env.example .env          # then add your OPENAI_API_KEY
 
-pytest -v                     # 43 tests, no API key needed
+pytest -v                     # 59 tests, no API key needed
 streamlit run playground.py   # UI with Approve/Reject
 uvicorn api:app --reload      # REST API, docs at http://127.0.0.1:8000/docs
 python -m evals.run_evals --gate   # evaluation run over 10 tickers, then the deployment gate
@@ -94,16 +97,18 @@ python -m evals.run_evals --gate   # evaluation run over 10 tickers, then the de
 
 ### API
 
+Set `API_KEYS` (and optionally `ADMIN_API_KEYS`) in `.env` to turn on authentication, then send `X-API-Key` with each request. With no keys set, auth is off for local development.
+
 | Endpoint | Purpose |
 |---|---|
 | `PUT /customers/{id}/context` `{"risk_tolerance": "low"}` | Set a customer's context |
-| `POST /reports` `{"ticker": "AAPL", "customer_id": "acme"}` | Start an analysis; returns `awaiting_approval` with the draft |
+| `POST /reports` `{"ticker": "AAPL"}` | Start an analysis; returns `awaiting_approval` with the draft. Optional `Idempotency-Key` header; rate limited per customer |
 | `POST /reports?async_mode=true` | Same, but returns `202` immediately; poll `GET /reports/{run_id}` |
 | `POST /reports/{run_id}/decision` `{"approved": true}` | Approve or reject the draft |
 | `GET /reports/{run_id}` | Status, report, and metrics (time, tokens, estimated cost) |
-| `GET /audit?ticker=AAPL` | Every decision made for a ticker |
+| `GET /audit?ticker=AAPL` | Every decision made for a ticker (admin) |
 | `GET /skills` | Every registered skill and version |
-| `GET /metrics?hours=24` | Recent runs: counts by status, failure rate, approval rate, latency, cost |
+| `GET /metrics?hours=24` | Recent runs: counts by status, failure rate, approval rate, latency, cost (admin) |
 | `GET /health` | Status and configured models |
 
 ## Evaluation
@@ -127,7 +132,8 @@ Results are saved to `evals/results/`, and `--baseline <file>` compares a new ru
 
 - **One job per agent, with only the tools it needs.** Focused prompts are more reliable, and each agent can be debugged alone.
 - **LLMs for judgment, code for guarantees.** Validation, formatting, saving, and audit logging always happen, so they're plain code rather than something a prompt asks the model to do.
-- **Analysis runs freely; actions need approval.** Reading data is low risk. Saving a report that others may rely on goes through a person first.
+- **Analysis runs freely; actions need approval.** Reading data is low risk. Saving a report that others may rely on goes through a person first, and agents are only given read-only tools.
+- **Never trust outside text.** Web results are data, not instructions: they're wrapped and scrubbed before reaching a prompt, and the customer always comes from the API key, never the request body.
 - **Every dependency is injectable.** Models, tools, memory, and the audit log are passed into `build_graph`, which is how the whole workflow is tested with scripted models.
 - **Fail gracefully.** A data outage is retried; a sub-agent that loops too long stops with a note instead of hanging the run; a crashed background run is recorded as `failed`.
 - **Prompts are versioned like code.** Changing a prompt means publishing a new skill version, so every report can be traced back to the exact prompts that produced it, and a bad release is one setting away from a rollback.
@@ -136,5 +142,5 @@ Results are saved to `evals/results/`, and `--baseline <file>` compares a new ru
 
 - Add a fundamentals agent (earnings, revenue, valuation), the biggest gap in the analysis today
 - Swap SQLite for Postgres and the worker threads for a real queue (SQS or Celery) to run across several servers
-- Authentication, so each customer can only see and change their own context and runs
+- Replace env-variable API keys with OAuth/SSO and hashed, rotatable keys
 - Track how recommendations change between runs for the same ticker

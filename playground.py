@@ -79,6 +79,8 @@ if run:
 
         if run["status"] == "awaiting_approval":
             st.subheader("Draft report: awaiting your approval")
+            for warning in run.get("warnings", []):  # problems the revision loop couldn't fix
+                st.warning(f"Output check: {warning}")
             st.markdown(run["report"])
             reason = st.text_input("Reason (optional, recorded in the audit log)")
             approve, reject = st.columns(2)

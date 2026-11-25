@@ -48,6 +48,14 @@ class Settings:
     # Async processing: how many analyses can run in the background at once
     worker_threads: int = int(os.getenv("WORKER_THREADS", "2"))
 
+    # Security: API keys mapped to customers, e.g. "key-abc=acme,key-def=globex".
+    # Leave both empty to turn auth off for local development.
+    api_keys: dict = field(default_factory=lambda: _pins("API_KEYS"))
+    admin_api_keys: set = field(default_factory=lambda: {
+        k.strip() for k in os.getenv("ADMIN_API_KEYS", "").split(",") if k.strip()})
+    # Max analyses each customer can start per minute (0 turns the limit off)
+    rate_limit_per_minute: int = int(os.getenv("RATE_LIMIT_PER_MINUTE", "10"))
+
     # Skill versions: pin a version to roll back a bad release, e.g. "writer=1.0.0"
     skill_versions: dict = field(default_factory=lambda: _pins("SKILL_VERSIONS"))
 

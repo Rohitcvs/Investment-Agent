@@ -8,18 +8,10 @@ import re
 
 from pydantic import BaseModel, Field
 
+from guardrails import extract_recommendation  # noqa: F401  (shared with the runtime output check)
 from tools import DISCLAIMER
 
-_RECOMMENDATION = re.compile(r"\b(strong\s+)?(buy|hold|sell)\b", re.IGNORECASE)
 _FIGURE = re.compile(r"-?\d[\d,]*\.\d+%?|-?\d[\d,]*%")  # figures like 61.2, 1,234.50 or 12%
-
-
-def extract_recommendation(report: str | None) -> str | None:
-    """The last Buy/Hold/Sell mentioned, since reports end with the recommendation."""
-    if not report:
-        return None
-    matches = _RECOMMENDATION.findall(report)
-    return matches[-1][1].capitalize() if matches else None
 
 
 def has_disclaimer(report: str | None) -> bool:

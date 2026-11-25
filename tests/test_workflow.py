@@ -54,7 +54,7 @@ def test_revision_loop_stops_after_max_revisions(make_graph):
 
 
 def test_research_and_technical_run_in_parallel_before_writer(make_graph):
-    graph, _, _, _ = make_graph(["APPROVED"], ["Draft 1"])
+    graph, _, _, _ = make_graph(["APPROVED"], ["Draft 1: Hold."])
     steps = [list(u)[0] for u in graph.stream(initial_state("AAPL"), CONFIG, stream_mode="updates")]
 
     assert steps[0] == "validate"
@@ -63,7 +63,7 @@ def test_research_and_technical_run_in_parallel_before_writer(make_graph):
 
 
 def test_approved_must_be_the_verdict_not_just_a_word(make_graph):
-    graph, _, _, _ = make_graph(["This is not approved yet: add dates.", "APPROVED"], ["Draft 1", "Draft 2"])
+    graph, _, _, _ = make_graph(["This is not approved yet: add dates.", "APPROVED"], ["Draft 1: Hold.", "Draft 2: Hold."])
     result = graph.invoke(initial_state("AAPL"), CONFIG)
     assert "Draft 2" in result["final_report"]
 

@@ -7,6 +7,7 @@ from typing import Optional
 
 from langchain_core.tools import BaseTool
 
+from guardrails import wrap_untrusted
 from resilience import TTLCache, with_retry
 from settings import settings
 
@@ -113,13 +114,15 @@ class EconomicResearcherTool(BaseTool):
                 results = list(ddgs.text(query, max_results=5))
             if not results:
                 return "No results found."
-            return "\n".join(
+            text = "\n".join(
                 f"Result {i + 1}:\n"
                 f"  Title: {r.get('title', 'N/A')}\n"
                 f"  Snippet: {r.get('body', 'N/A')}\n"
                 f"  URL: {r.get('href', 'N/A')}\n"
                 for i, r in enumerate(results)
             )
+            # Search results are written by strangers: mark them as data, not instructions.
+            return wrap_untrusted(text, source="web_search")
         except Exception as e:
             return f"An error occurred during the search: {e}"
 
@@ -160,6 +163,12 @@ class MemoryTool(BaseTool):
         "Use action='save' with a ticker and report to store a new report."
     )
     file_path: str = "report_memory.json"
+    read_only: bool = False  # least privilege: agents get a read-only copy; only approved code paths save
+
+    def read_only_view(self) -> "MemoryTool":
+        """The same memory, but `save` is refused. This is what the research agent is given."""
+        return MemoryTool(file_path=self.file_path, read_only=True,
+                          description="Retrieves past financial reports for a ticker (action='retrieve').")
 
     def _load(self) -> dict:
         if not os.path.exists(self.file_path):
@@ -194,6 +203,8 @@ class MemoryTool(BaseTool):
         if not ticker:
             return "Error: a 'ticker' is required."
         if action == "save":
+            if self.read_only:
+                return "Error: this agent can only retrieve reports. Reports are saved after human approval."
             return self.save(ticker, report) if report else "Error: 'save' requires a 'report'."
         if action == "retrieve":
             return self.retrieve(ticker)

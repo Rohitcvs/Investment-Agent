@@ -59,7 +59,7 @@ def test_rejected_report_is_not_saved_but_is_audited(make_graph):
 
 
 def test_cannot_decide_twice(make_graph):
-    graph, _, _, _ = make_graph(["APPROVED"], ["Draft"], require_approval=True)
+    graph, _, _, _ = make_graph(["APPROVED"], ["Draft: Hold."], require_approval=True)
     service = AnalysisService(graph)
     run = service.start("AAPL")
     service.decide(run["run_id"], approved=True)
@@ -68,7 +68,7 @@ def test_cannot_decide_twice(make_graph):
 
 
 def test_full_run_is_audited_in_order(make_graph):
-    graph, _, _, audit = make_graph(["Add dates.", "APPROVED"], ["Draft 1", "Draft 2"])
+    graph, _, _, audit = make_graph(["Add dates.", "APPROVED"], ["Draft 1: Hold.", "Draft 2: Hold."])
     graph.invoke(initial_state("AAPL"), CONFIG)
     events = [e["event"] for e in audit.entries()]
     assert events == ["run_started", "critic_decision", "critic_decision", "approval_decision", "report_saved"]
@@ -76,7 +76,7 @@ def test_full_run_is_audited_in_order(make_graph):
 
 def test_sub_agent_step_limit_stops_runaway_loops(make_graph):
     looping = [call("Memory_Tool", {"action": "retrieve", "ticker": "AAPL"}, f"r{i}") for i in range(50)]
-    graph, models, _, _ = make_graph(["APPROVED"], ["Draft"], research_replies=looping)
+    graph, models, _, _ = make_graph(["APPROVED"], ["Draft: Hold."], research_replies=looping)
     result = graph.invoke(initial_state("AAPL"), CONFIG)
 
     assert "stopped after" in result["research_data"]           # gave up gracefully instead of looping forever
